@@ -1,9 +1,13 @@
 package com.reactnativemediapipe.facelandmarkdetection
 
-import com.google.mediapipe.framework.image.MediaImageBuilder
+import android.graphics.Bitmap
+import android.graphics.Matrix
+import androidx.camera.core.ImageProxy
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.mrousavy.camera.core.types.PixelFormat
 import com.mrousavy.camera.frameprocessors.Frame
 import com.mrousavy.camera.frameprocessors.FrameProcessorPlugin
-import com.reactnativemediapipe.shared.imageOrientation
+import com.reactnativemediapipe.shared.orientationToDegrees
 
 class FaceLandmarkDetectionFrameProcessorPlugin() : FrameProcessorPlugin() {
 
@@ -12,18 +16,43 @@ class FaceLandmarkDetectionFrameProcessorPlugin() : FrameProcessorPlugin() {
   }
 
   override fun callback(frame: Frame, params: MutableMap<String, Any>?): Any? {
-    val detectorHandle = (params?.get("detectorHandle") as? Double) ?: return false
+    val detectorHandle: Double = params!!["detectorHandle"] as Double
     val detector = FaceLandmarkDetectorMap.detectorMap[detectorHandle.toInt()] ?: return false
-    val orientation = params["orientation"] as String
-    val mappedOrientation = imageOrientation(orientation)
-    mappedOrientation ?: return false
 
-    val mpImage = MediaImageBuilder(frame.image).build()
-    detector.detectLiveStream(mpImage, mappedOrientation)
+    val bitmap = imageToBitmap(frame.imageProxy)
+    if (bitmap != null) {
+      // 수동 회전 로직 제거. 성능 저하의 주요 원인입니다.
+      // val rotated = rotateBitmap(bitmap, orientationToDegrees(frame.orientation).toFloat())
+      
+      // 원본 비트맵으로 MPImage를 생성합니다.
+      val mpImage = BitmapImageBuilder(bitmap).build()
+      
+      // 원본 비트맵을 함께 전달하여 MediaPipe가 회전을 처리하도록 합니다.
+      detector.detectLiveStream(mpImage, frame.orientation, bitmap)
+    }
     return true
   }
 
+  private var bitmapBuffer: Bitmap? = null
+  private fun imageToBitmap(image: ImageProxy): Bitmap? {
+    if (bitmapBuffer == null) {
+      bitmapBuffer = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+    }
+    bitmapBuffer?.let {
+      val buffer = image.planes[0].buffer
+      it.copyPixelsFromBuffer(buffer)
+    }
+    return bitmapBuffer
+  }
+
+  private fun rotateBitmap(source: Bitmap, angle: Float): Bitmap {
+    val matrix = Matrix()
+    matrix.postRotate(angle)
+    return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+  }
+
   private enum class PixelFormat {
+    // Integer-Values (ordinals) to be in sync with ResizePlugin.h
     RGB,
     BGR,
     ARGB,
@@ -46,6 +75,7 @@ class FaceLandmarkDetectionFrameProcessorPlugin() : FrameProcessorPlugin() {
   }
 
   private enum class DataType {
+    // Integer-Values (ordinals) to be in sync with ResizePlugin.h
     UINT8,
     FLOAT32;
 

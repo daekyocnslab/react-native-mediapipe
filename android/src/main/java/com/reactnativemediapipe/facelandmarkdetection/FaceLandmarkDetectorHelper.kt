@@ -2,8 +2,6 @@ package com.reactnativemediapipe.facelandmarkdetection
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.media.MediaMetadataRetriever
-import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -17,8 +15,13 @@ import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.mrousavy.camera.core.types.Orientation
 import com.reactnativemediapipe.shared.orientationToDegrees
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.*
 
 class FaceLandmarkDetectorHelper(
     var minFaceDetectionConfidence: Float = DEFAULT_FACE_DETECTION_CONFIDENCE,
@@ -34,6 +37,20 @@ class FaceLandmarkDetectorHelper(
 
   private var faceLandmarker: FaceLandmarker? = null
   private var imageRotation = 0
+  private var currentBitmap: Bitmap? = null
+
+  // MediaPipe 랜드마크 인덱스 정의 (파이썬 코드와 동일)
+  private val leftEyeIndices = listOf(33, 160, 158, 133, 153, 144)
+  private val rightEyeIndices = listOf(362, 385, 387, 263, 373, 380)
+  private val leftIrisIndices = listOf(468, 469, 470, 471)
+  private val rightIrisIndices = listOf(473, 474, 475, 476)
+  
+  // MAR 계산을 위한 입술 랜드마크 인덱스
+  private val mouthIndices = listOf(
+    13, 14, 15, 16, 17, 18, // 상단 입술 외곽
+    61, 84, 17, 314, 405, 320, 307, 375, 308, 324, 318, // 하단 입술 외곽
+    78, 95, 88, 178, 87, 14, 317, 402, 318, 324 // 입술 내부
+  )
 
   init {
     setupFaceLandmarker()
@@ -41,6 +58,7 @@ class FaceLandmarkDetectorHelper(
 
   fun clearFaceLandmarker() {
     faceLandmarkDetectorListener = null
+    currentBitmap = null
     Handler(Looper.getMainLooper())
         .postDelayed(
             {
@@ -117,6 +135,145 @@ class FaceLandmarkDetectorHelper(
     return faceLandmarker == null
   }
 
+  /**
+   * EAR (Eye Aspect Ratio) 계산
+   */
+  private fun calculateEAR(eyeLandmarks: List<NormalizedLandmark>): Float {
+    if (eyeLandmarks.size != 6) return 0f
+    
+    // 수직 거리 계산 (눈의 높이)
+    val verticalDist1 = sqrt(
+      (eyeLandmarks[1].x() - eyeLandmarks[5].x()).pow(2) + 
+      (eyeLandmarks[1].y() - eyeLandmarks[5].y()).pow(2)
+    )
+    val verticalDist2 = sqrt(
+      (eyeLandmarks[2].x() - eyeLandmarks[4].x()).pow(2) + 
+      (eyeLandmarks[2].y() - eyeLandmarks[4].y()).pow(2)
+    )
+    
+    // 수평 거리 계산 (눈의 폭)
+    val horizontalDist = sqrt(
+      (eyeLandmarks[0].x() - eyeLandmarks[3].x()).pow(2) + 
+      (eyeLandmarks[0].y() - eyeLandmarks[3].y()).pow(2)
+    )
+    
+    return if (horizontalDist > 0) {
+      (verticalDist1 + verticalDist2) / (2.0f * horizontalDist)
+    } else 0f
+  }
+
+  /**
+   * MAR (Mouth Aspect Ratio) 계산
+   */
+  private fun calculateMAR(landmarks: List<NormalizedLandmark>): Float {
+    // 입술의 수직 거리들
+    val verticalDistances = listOf(
+      // 상하 입술 중앙
+      sqrt((landmarks[13].x() - landmarks[14].x()).pow(2) + (landmarks[13].y() - landmarks[14].y()).pow(2)),
+      // 좌측 입술
+      sqrt((landmarks[78].x() - landmarks[95].x()).pow(2) + (landmarks[78].y() - landmarks[95].y()).pow(2)),
+      // 우측 입술  
+      sqrt((landmarks[308].x() - landmarks[324].x()).pow(2) + (landmarks[308].y() - landmarks[324].y()).pow(2))
+    )
+    
+    // 수평 거리 (입의 폭)
+    val horizontalDist = sqrt(
+      (landmarks[61].x() - landmarks[291].x()).pow(2) + 
+      (landmarks[61].y() - landmarks[291].y()).pow(2)
+    )
+    
+    val avgVerticalDist = verticalDistances.average().toFloat()
+    return if (horizontalDist > 0) avgVerticalDist / horizontalDist else 0f
+  }
+
+  /**
+   * 시선 추정 (간단한 버전)
+   */
+  private fun estimateGaze(irisCenter: Pair<Float, Float>, eyeLeft: NormalizedLandmark, eyeRight: NormalizedLandmark): Float {
+    val eyeCenterX = (eyeLeft.x() + eyeRight.x()) / 2f
+    val gazeOffset = irisCenter.first - eyeCenterX
+    val eyeWidth = abs(eyeRight.x() - eyeLeft.x())
+    return if (eyeWidth > 0) gazeOffset / eyeWidth else 0f
+  }
+
+  /**
+   * 랜드마크 중심점 계산
+   */
+  private fun calculateCenter(landmarks: List<NormalizedLandmark>): Pair<Float, Float> {
+    val centerX = landmarks.map { it.x() }.average().toFloat()
+    val centerY = landmarks.map { it.y() }.average().toFloat()
+    return Pair(centerX, centerY)
+  }
+
+  /**
+   * 거리 계산
+   */
+  private fun calculateDistance(p1: Pair<Float, Float>, p2: Pair<Float, Float>): Float {
+    return sqrt((p1.first - p2.first).pow(2) + (p1.second - p2.second).pow(2))
+  }
+
+  /**
+   * 특징 계산 메인 함수
+   */
+  private fun calculateFaceFeatures(landmarks: List<NormalizedLandmark>, imageWidth: Int, imageHeight: Int): FaceFeatures {
+    // 왼쪽, 오른쪽 눈 랜드마크 추출
+    val leftEyeLandmarks = leftEyeIndices.map { landmarks[it] }
+    val rightEyeLandmarks = rightEyeIndices.map { landmarks[it] }
+    val leftIrisLandmarks = leftIrisIndices.map { landmarks[it] }
+    val rightIrisLandmarks = rightIrisIndices.map { landmarks[it] }
+    
+    // EAR 계산 (정규화된 좌표로 계산)
+    val leftEAR = calculateEAR(leftEyeLandmarks)
+    val rightEAR = calculateEAR(rightEyeLandmarks)
+    val avgEAR = (leftEAR + rightEAR) / 2f
+    
+    // MAR 계산 (정규화된 좌표로 계산)
+    val mar = calculateMAR(landmarks)
+    
+    // 눈과 홍채 중심점 계산 (정규화된 좌표)
+    val leftEyeCenter = calculateCenter(leftEyeLandmarks)
+    val rightEyeCenter = calculateCenter(rightEyeLandmarks)
+    val leftIrisCenter = calculateCenter(leftIrisLandmarks)
+    val rightIrisCenter = calculateCenter(rightIrisLandmarks)
+    
+    // 얼굴 중심점 계산 (정규화된 좌표)
+    val faceCenter = calculateCenter(landmarks)
+    
+    // 시선 추정 (정규화된 좌표로 계산)
+    val leftGaze = estimateGaze(leftIrisCenter, landmarks[33], landmarks[133])
+    val rightGaze = estimateGaze(rightIrisCenter, landmarks[362], landmarks[263])
+    
+    // 픽셀 좌표로 변환하여 눈 폭 계산
+    val leftEyePixelLeft = Pair(landmarks[33].x() * imageWidth, landmarks[33].y() * imageHeight)
+    val leftEyePixelRight = Pair(landmarks[133].x() * imageWidth, landmarks[133].y() * imageHeight)
+    val rightEyePixelLeft = Pair(landmarks[362].x() * imageWidth, landmarks[362].y() * imageHeight)
+    val rightEyePixelRight = Pair(landmarks[263].x() * imageWidth, landmarks[263].y() * imageHeight)
+    
+    val leftEyeWidth = calculateDistance(leftEyePixelLeft, leftEyePixelRight)
+    val rightEyeWidth = calculateDistance(rightEyePixelLeft, rightEyePixelRight)
+    
+    return FaceFeatures(
+      earLeft = leftEAR,
+      earRight = rightEAR,
+      earAvg = avgEAR,
+      gazeLeft = leftGaze,
+      gazeRight = rightGaze,
+      mar = mar,
+      leftEyeX = leftEyeCenter.first * imageWidth,
+      leftEyeY = leftEyeCenter.second * imageHeight,
+      rightEyeX = rightEyeCenter.first * imageWidth,
+      rightEyeY = rightEyeCenter.second * imageHeight,
+      leftIrisX = leftIrisCenter.first * imageWidth,
+      leftIrisY = leftIrisCenter.second * imageHeight,
+      rightIrisX = rightIrisCenter.first * imageWidth,
+      rightIrisY = rightIrisCenter.second * imageHeight,
+      faceCenterX = faceCenter.first * imageWidth,
+      faceCenterY = faceCenter.second * imageHeight,
+      leftEyeWidth = leftEyeWidth,
+      rightEyeWidth = rightEyeWidth
+    )
+  }
+
   fun detectImage(image: Bitmap): ResultBundle {
     if (runningMode != RunningMode.IMAGE) {
       throw IllegalArgumentException(
@@ -129,27 +286,41 @@ class FaceLandmarkDetectorHelper(
 
     faceLandmarker?.detect(mpImage)?.also { landmarkResult ->
       val inferenceTimeMs = SystemClock.uptimeMillis() - startTime
+      
+      // 특징 계산 (이미지 크기 정보 전달)
+      var faceFeatures: FaceFeatures? = null
+      if (landmarkResult.faceLandmarks().isNotEmpty()) {
+        faceFeatures = calculateFaceFeatures(landmarkResult.faceLandmarks()[0], image.width, image.height)
+      }
+      
       return ResultBundle(
           results = listOf(landmarkResult),
           inferenceTime = inferenceTimeMs,
           inputImageHeight = image.height,
           inputImageWidth = image.width,
-          inputImageRotation = imageRotation
+          inputImageRotation = imageRotation,
+          faceFeatures = faceFeatures
       )
     }
 
     throw Exception("Face Landmarker failed to detect.")
   }
 
+  // 기존 메서드 (하위 호환성 유지)
   fun detectLiveStream(mpImage: MPImage, orientation: Orientation) {
+    detectLiveStream(mpImage, orientation, null)
+  }
+
+  // 비트맵을 함께 전달하는 새로운 메서드
+  fun detectLiveStream(mpImage: MPImage, orientation: Orientation, sourceBitmap: Bitmap?) {
     if (runningMode != RunningMode.LIVE_STREAM) {
       throw IllegalArgumentException(
           "Attempting to call detectLiveStream while not using RunningMode.LIVE_STREAM"
       )
     }
     val frameTime = SystemClock.uptimeMillis()
-    //this.imageRotation = orientationToDegrees(orientation)
     this.imageRotation = orientationToDegrees(Orientation.PORTRAIT)
+    this.currentBitmap = sourceBitmap
     detectAsync(mpImage, frameTime, this.imageRotation)
   }
 
@@ -161,10 +332,129 @@ class FaceLandmarkDetectorHelper(
     faceLandmarker?.detectAsync(mpImage, imageProcessingOptions, frameTime)
   }
 
+  /**
+   * 크롭된 이미지를 ONNX 모델 입력 형식 (NHWC Float32Array)로 변환
+   */
+  private fun convertBitmapToOnnxInput(croppedBitmap: Bitmap): FloatArray {
+    val resizedBitmap = Bitmap.createScaledBitmap(croppedBitmap, 64, 64, true)
+    
+    val tensorData = FloatArray(1 * 64 * 64 * 3)
+    val pixels = IntArray(64 * 64)
+    resizedBitmap.getPixels(pixels, 0, 64, 0, 0, 64, 64)
+    
+    for (h in 0 until 64) {
+      for (w in 0 until 64) {
+        val pixelIndex = h * 64 + w
+        val pixel = pixels[pixelIndex]
+        
+        val r = (pixel shr 16) and 0xFF
+        val g = (pixel shr 8) and 0xFF
+        val b = pixel and 0xFF
+        
+        val baseIndex = h * 64 * 3 + w * 3
+        
+        tensorData[baseIndex] = (b / 255.0f) * 255.0f        // B
+        tensorData[baseIndex + 1] = (g / 255.0f) * 255.0f    // G  
+        tensorData[baseIndex + 2] = (r / 255.0f) * 255.0f    // R
+      }
+    }
+    
+    if (resizedBitmap != croppedBitmap) {
+      resizedBitmap.recycle()
+    }
+    
+    Log.d(TAG, "Converted bitmap to ONNX input: ${tensorData.size} floats")
+    return tensorData
+  }
+
+  /**
+   * FloatArray를 ByteArray로 변환
+   */
+  private fun floatArrayToByteArray(floatArray: FloatArray): ByteArray {
+    val byteBuffer = ByteBuffer.allocate(floatArray.size * 4)
+    byteBuffer.order(ByteOrder.nativeOrder())
+    val floatBuffer = byteBuffer.asFloatBuffer()
+    floatBuffer.put(floatArray)
+    return byteBuffer.array()
+  }
+
   private fun returnLivestreamResult(result: FaceLandmarkerResult, input: MPImage) {
-    if (result.faceLandmarks().size > 0) {
+    if (result.faceLandmarks().isNotEmpty()) {
       val finishTimeMs = SystemClock.uptimeMillis()
       val inferenceTime = finishTimeMs - result.timestampMs()
+
+      var croppedFrameByteArray: ByteArray? = null
+      var onnxInputData: ByteArray? = null
+      var faceFeatures: FaceFeatures? = null
+      
+      // 얼굴 특징 계산 (이미지 크기 정보 전달)
+      faceFeatures = calculateFaceFeatures(result.faceLandmarks()[0], input.width, input.height)
+      
+      // currentBitmap이 있을 때만 크롭 작업 수행
+      currentBitmap?.let { sourceBitmap ->
+        try {
+          // 얼굴 바운딩 박스 계산
+          var minX = 1.0f
+          var minY = 1.0f
+          var maxX = 0.0f
+          var maxY = 0.0f
+          result.faceLandmarks()[0].forEach { landmark ->
+              minX = minOf(minX, landmark.x())
+              minY = minOf(minY, landmark.y())
+              maxX = maxOf(maxX, landmark.x())
+              maxY = maxOf(maxY, landmark.y())
+          }
+
+          // 마진 추가
+          val margin = 0.1f
+          minX = maxOf(0.0f, minX - margin)
+          minY = maxOf(0.0f, minY - margin)
+          maxX = minOf(1.0f, maxX + margin)
+          maxY = minOf(1.0f, maxY + margin)
+
+          val cropX = (minX * sourceBitmap.width).toInt()
+          val cropY = (minY * sourceBitmap.height).toInt()
+          val cropWidth = ((maxX - minX) * sourceBitmap.width).toInt()
+          val cropHeight = ((maxY - minY) * sourceBitmap.height).toInt()
+
+          if (cropWidth > 0 && cropHeight > 0 && 
+              cropX >= 0 && cropY >= 0 && 
+              cropX + cropWidth <= sourceBitmap.width && 
+              cropY + cropHeight <= sourceBitmap.height) {
+              
+              val croppedBitmap = Bitmap.createBitmap(
+                  sourceBitmap,
+                  cropX,
+                  cropY,
+                  cropWidth,
+                  cropHeight
+              )
+
+              val resizedBitmap = Bitmap.createScaledBitmap(
+                  croppedBitmap, 192, 192, true
+              )
+
+              // Base64 이미지 생성
+              val stream = ByteArrayOutputStream()
+              resizedBitmap.compress(Bitmap.CompressFormat.JPEG, 80, stream)
+              croppedFrameByteArray = stream.toByteArray()
+              
+              // ONNX 입력 데이터 생성
+              val onnxFloatData = convertBitmapToOnnxInput(resizedBitmap)
+              onnxInputData = floatArrayToByteArray(onnxFloatData)
+              
+              Log.d(TAG, "Successfully processed face: JPEG=${croppedFrameByteArray.size} bytes, ONNX=${onnxInputData.size} bytes")
+              
+              croppedBitmap.recycle()
+              resizedBitmap.recycle()
+          } else {
+            Log.w(TAG, "Invalid crop dimensions: x=$cropX, y=$cropY, w=$cropWidth, h=$cropHeight")
+          }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to process frame: ${e.message}", e)
+        }
+      }
 
       faceLandmarkDetectorListener?.onResults(
           ResultBundle(
@@ -172,9 +462,14 @@ class FaceLandmarkDetectorHelper(
               inferenceTime = inferenceTime,
               inputImageHeight = input.height,
               inputImageWidth = input.width,
-              inputImageRotation = imageRotation
+              inputImageRotation = imageRotation,
+              croppedFrame = croppedFrameByteArray,
+              onnxInputData = onnxInputData,
+              faceFeatures = faceFeatures
           )
       )
+      
+      Log.d(TAG, "Sent ResultBundle with face features and ONNX data")
     } else {
       faceLandmarkDetectorListener?.onEmpty()
     }
@@ -198,12 +493,39 @@ class FaceLandmarkDetectorHelper(
     const val GPU_ERROR = 1
   }
 
+  /**
+   * 얼굴 특징을 담는 데이터 클래스
+   */
+  data class FaceFeatures(
+    val earLeft: Float,
+    val earRight: Float,
+    val earAvg: Float,
+    val gazeLeft: Float,
+    val gazeRight: Float,
+    val mar: Float,
+    val leftEyeX: Float,
+    val leftEyeY: Float,
+    val rightEyeX: Float,
+    val rightEyeY: Float,
+    val leftIrisX: Float,
+    val leftIrisY: Float,
+    val rightIrisX: Float,
+    val rightIrisY: Float,
+    val faceCenterX: Float,
+    val faceCenterY: Float,
+    val leftEyeWidth: Float,
+    val rightEyeWidth: Float
+  )
+
   data class ResultBundle(
       val results: List<FaceLandmarkerResult>,
       val inferenceTime: Long,
       val inputImageHeight: Int,
       val inputImageWidth: Int,
-      val inputImageRotation: Int = 0
+      val inputImageRotation: Int = 0,
+      val croppedFrame: ByteArray? = null,
+      val onnxInputData: ByteArray? = null,
+      val faceFeatures: FaceFeatures? = null
   )
 
   interface DetectorListener {
