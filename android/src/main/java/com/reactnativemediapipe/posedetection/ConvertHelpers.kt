@@ -18,12 +18,11 @@ object PoseMap {
   )
 }
 
-
 fun convertResultBundleToWritableMap(resultBundle: PoseDetectorHelper.ResultBundle): WritableMap {
   val map = Arguments.createMap()
   val resultsArray = Arguments.createArray()
   resultBundle.results.forEach { result ->
-    resultsArray.pushMap(poseLandmarkerResultToWritableMap(result))
+    resultsArray.pushMap(poseLandmarkerResultToWritableMap(result, resultBundle.inputImageWidth, resultBundle.inputImageHeight))
   }
   map.putArray("results", resultsArray)
   map.putInt("inputImageHeight", resultBundle.inputImageHeight)
@@ -32,7 +31,7 @@ fun convertResultBundleToWritableMap(resultBundle: PoseDetectorHelper.ResultBund
   return map
 }
 
-fun poseLandmarkerResultToWritableMap(result: PoseLandmarkerResult): WritableMap {
+fun poseLandmarkerResultToWritableMap(result: PoseLandmarkerResult, imageWidth: Int, imageHeight: Int): WritableMap {
   val resultMap = WritableNativeMap()
   val landmarksArray = WritableNativeArray()
   val worldLandmarksArray = WritableNativeArray()
@@ -50,12 +49,17 @@ fun poseLandmarkerResultToWritableMap(result: PoseLandmarkerResult): WritableMap
         val landmarkName = PoseMap.POSE_LANDMARKS[index]!!
         val landmarkData = WritableNativeMap()
         
-        // visibility가 0.5 이상일 때만 좌표 저장 (Python 코드와 동일한 로직)
+        // visibility가 0.5 이상일 때만 좌표 저장 (Python 코드와 동일)
         if (landmark.visibility().isPresent && landmark.visibility().get() > 0.5f) {
-          landmarkData.putDouble("x", landmark.x().toDouble())
-          landmarkData.putDouble("y", landmark.y().toDouble())
+          // normalized 좌표에 이미지 크기를 곱해서 실제 픽셀 좌표로 변환
+          val actualX = landmark.x() * imageWidth
+          val actualY = landmark.y() * imageHeight
+          
+          landmarkData.putDouble("x", actualX.toDouble())
+          landmarkData.putDouble("y", actualY.toDouble())
           landmarkData.putDouble("visibility", landmark.visibility().get().toDouble())
         } else {
+          // visibility가 0.5 이하일 때는 null 저장 (Python에서 np.nan과 동일)
           landmarkData.putNull("x")
           landmarkData.putNull("y")
           landmarkData.putDouble("visibility", landmark.visibility().orElse(0.0f).toDouble())
