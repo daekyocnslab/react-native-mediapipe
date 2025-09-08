@@ -186,6 +186,15 @@ class FaceLandmarkDetectionModule: RCTEventEmitter {
   }
 }
 
+func connectorsToArray(_ connections: [Connection]) -> [[String: Any]] {
+  return connections.map {
+    [
+      "start": $0.start,
+      "end": $0.end
+    ]
+  }
+}
+
 extension FaceLandmarkDetectionModule: FaceLandmarkDetectorHelperDelegate {
   func faceLandmarkDetectorHelper(
     _ faceLandmarkDetectorHelper: FaceLandmarkDetectorHelper,
